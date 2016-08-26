@@ -195,34 +195,26 @@ def learnPrimal(trainData, labels, reg=0.1):
     '''Learn a model from trainData -> labels '''
 
     trainData = trainData.reshape(trainData.shape[0],-1)
-
     X = np.ascontiguousarray(trainData, dtype=np.float32).reshape(trainData.shape[0], -1)
     print "X SHAPE ", trainData.shape
     print "Computing XTX"
     XTX = X.T.dot(X)
     print "Done Computing XTX"
-
-    print "REG is " + str(reg)
     idxes = np.diag_indices(XTX.shape[0])
     XTX[idxes] += reg
-
     y = np.eye(max(labels) + 1)[labels]
     XTy = X.T.dot(y)
-
-    print "Learning Primal Model"
     model = scipy.linalg.solve(XTX, XTy)
     return model
 
 def learnDual(gramMatrix, labels, reg=0.1, TOT_FEAT=1, NUM_TRAIN=1):
     ''' Learn a model from K matrix -> labels '''
-    print ("Learning Dual Model")
+    print ("Learning Dual Model updated")
     y = np.eye(max(labels) + 1)[labels]
     idxes = np.diag_indices(gramMatrix.shape[0])
-    gramMatrix /= float(TOT_FEAT)
-    gramMatrix[idxes] += (NUM_TRAIN * reg)
-    model = scipy.linalg.solve(gramMatrix + NUM_TRAIN * reg * np.eye(gramMatrix.shape[0]), y)
-    gramMatrix[idxes] -= (NUM_TRAIN * reg)
-    gramMatrix *= TOT_FEAT
+    gramMatrix[idxes] += reg
+    model = scipy.linalg.solve(gramMatrix, y)
+    gramMatrix[idxes] -= reg
     return model
 
 def evaluatePrimalModel(data, model):
@@ -232,24 +224,18 @@ def evaluatePrimalModel(data, model):
 
 
 def evaluateDualModel(kMatrix, model, TOT_FEAT=1):
-    print("MODEL SHAPE " + str(model.shape))
-    print("KERNEL SHAPE " + str(kMatrix.shape))
-    kMatrix *= TOT_FEAT
     y = kMatrix.dot(model)
-    kMatrix /= TOT_FEAT
-    print("pred SHAPE " + str(y.shape))
     yHat = np.argmax(y, axis=1)
     return yHat
 
-def trainAndEvaluateDualModel(XTrain, XTest, labelsTrain, labelsTest, reg=0.1):
-    K = XTrain.dot(XTrain.T)
-    KTest = XTest.dot(XTrain)
-    model = learnDual(K,labelsTrain, reg=reg)
-    predTrainLabels = evaluateDualModel(K, model)
+def trainAndEvaluateDualModel(KTrain, KTest, labelsTrain, labelsTest, reg=0.1):
+    model = learnDual(KTrain,labelsTrain, reg=reg)
+    predTrainLabels = evaluateDualModel(KTrain, model)
     predTestLabels = evaluateDualModel(KTest, model)
     train_acc = metrics.accuracy_score(labelsTrain, predTrainLabels)
     test_acc = metrics.accuracy_score(labelsTest, predTestLabels)
     return train_acc, test_acc
+
 
 
 def trainAndEvaluatePrimalModel(XTrain, XTest, labelsTrain, labelsTest, reg=0.1):
@@ -294,7 +280,7 @@ def featurizeTrainAndEvaluateDualModel(XTrain, XTest, labelsTrain, labelsTest, f
             print "(dual conv #{batchNo}) train: , {convTrainAcc}, (dual conv batch #{batchNo}) test: {convTestAcc}".format(batchNo=i, convTrainAcc=train_acc, convTestAcc=test_acc)
     return train_acc, test_acc
 
-def featurizeTrainAndEvaluateDualModelAsync(XTrain, XTest, labelsTrain, labelsTest, filter_gen, solve=False, num_feature_batches=1, solve_every_iter=1, regs=[0.1], pool_size=14, FEATURE_BATCH_SIZE=1024, CUDA_CONVNET=True, DATA_BATCH_SIZE=1280):
+def featurizeTrainAndEvaluateDualModelAsync(XTrain, XTest, labelsTrain, labelsTest, filter_gen,  num_feature_batches=1, solve=False, solve_every_iter=1, regs=[0.1], pool_size=14, FEATURE_BATCH_SIZE=1024, CUDA_CONVNET=True, DATA_BATCH_SIZE=1280):
     print("RELOADING MOTHER FUCKER 3")
     X = np.vstack((XTrain, XTest))
     parent, child = Pipe()
@@ -302,10 +288,8 @@ def featurizeTrainAndEvaluateDualModelAsync(XTrain, XTest, labelsTrain, labelsTe
     trainKernelShared = sa.create("shm://trainKernel", (XTrain.shape[0], XTrain.shape[0]), dtype='float32')
     testKernelShared = sa.create("shm://testKernel", (XTest.shape[0], XTrain.shape[0]), dtype='float32')
 
-    trainKernelLocal = np.zeros((XTrain.shape[0], XTrain.shape[0]))
-    testKernelLocal = np.zeros((XTest.shape[0], XTrain.shape[0]))
 
-    p = Process(target=accumulateGramAndSolveAsync, args=(child,XTrain.shape[0], XTest.shape[0], regs, labelsTrain, labelsTest, solve))
+    p = Process(target=accumulateGramAndSolveAsync, args=(child, XTrain.shape[0], XTest.shape[0], regs, labelsTrain, labelsTest, solve))
     p.start()
     try:
         for i in range(1, (num_feature_batches + 1)):
@@ -321,15 +305,18 @@ def featurizeTrainAndEvaluateDualModelAsync(XTrain, XTest, labelsTrain, labelsTe
             time2 = time.time()
             print 'Sending features took {0} seconds'.format((time2-time1))
         parent.send(-1)
-        child.recv()
-        print("Receiving kernel from child")
-        np.copyto(trainKernelLocal, trainKernelShared)
-        np.copyto(testKernelLocal, testKernelShared)
-        parent.close()
-        child.close()
+        parent.recv()
+        if (not solve):
+            print("Receiving kernel from child")
+            trainKernelLocal = np.zeros((XTrain.shape[0], XTrain.shape[0]))
+            testKernelLocal = np.zeros((XTest.shape[0], XTrain.shape[0]))
+            np.copyto(trainKernelLocal, trainKernelShared)
+            np.copyto(testKernelLocal, testKernelShared)
+            parent.close()
+            child.close()
+            sa.delete("shm://trainKernel")
+            sa.delete("shm://testKernel")
         sa.delete("shm://xbatch")
-        sa.delete("shm://trainKernel")
-        sa.delete("shm://testKernel")
         return trainKernelLocal, testKernelLocal
     except (KeyboardInterrupt, SystemExit):
         sa.delete("shm://xbatch")
@@ -341,7 +328,7 @@ def featurizeTrainAndEvaluateDualModelAsync(XTrain, XTest, labelsTrain, labelsTe
         raise
 
 
-def accumulateGramAndSolveAsync(pipe, numTrain, numTest, regs, labelsTrain, labelsTest, solve=False):
+def accumulateGramAndSolveAsync(pipe,  numTrain, numTest, regs, labelsTrain, labelsTest, solve=False):
     trainKernel = np.zeros((numTrain, numTrain), dtype='float32')
     testKernel= np.zeros((numTest, numTrain), dtype='float32')
     XBatchShared = sa.attach("shm://xbatch")
@@ -350,7 +337,7 @@ def accumulateGramAndSolveAsync(pipe, numTrain, numTest, regs, labelsTrain, labe
 
     # Local copy
     XBatchLocal = np.zeros(XBatchShared.shape, dtype='float32')
-    print("CHILD Process Spun")
+    print("CHILD Process Spun yupyup")
     TOT_FEAT = 0
     while(True):
         m = pipe.recv()
@@ -372,6 +359,7 @@ def accumulateGramAndSolveAsync(pipe, numTrain, numTest, regs, labelsTrain, labe
         time2 = time.time()
         print 'Accumulating (ASYNC) Batch {1} gram took {0} seconds'.format((time2-time1), m)
 
+
     train_accs = []
     test_accs = []
     if (solve):
@@ -390,6 +378,11 @@ def accumulateGramAndSolveAsync(pipe, numTrain, numTest, regs, labelsTrain, labe
             print "(async dual conv reg: {reg}) train: , {convTrainAcc}, (dual conv batch) test: {convTestAcc}".format(convTrainAcc=train_acc, convTestAcc=test_acc, reg=reg)
             train_accs.append(train_acc)
             test_accs.append(test_acc)
+    else:
+        np.copyto(trainKernelShared, trainKernel)
+        np.copyto(testKernelShared, testKernel)
+        pipe.send(1)
+
     return train_accs, test_accs
 
 
@@ -475,6 +468,7 @@ def make_gaussian_filter_gen(bandwidth, patch_size=6, channels=3):
         return out
     return gaussian_filter_gen
 
+
 def make_gaussian_cov_filter_gen(patches, sub_sample=100000):
     patches = patches.reshape(patches.shape[0]*patches.shape[1],*patches.shape[2:])
     idxs = np.random.choice(patches.shape[0], sub_sample, replace=False)
@@ -544,7 +538,7 @@ if __name__ == "__main__":
     (XTrain, labelsTrain), (XTest, labelsTest) = load_cifar_processed()
     patches = patchify_all_imgs(XTrain, (6,6), pad=False)
     if FILTER_GEN == 'gaussian':
-        filter_gen = make_gaussian_filter_gen(1.0)
+       filter_gen = make_gaussian_filter_gen(1.0)
     elif FILTER_GEN == 'empirical':
         filter_gen = make_empirical_filter_gen(patches, labelsTrain)
     elif FILTER_GEN == 'empirical_balanced':
