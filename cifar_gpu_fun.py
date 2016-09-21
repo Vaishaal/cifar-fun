@@ -16,6 +16,7 @@ from multiprocessing import Process, Queue
 import numpy as np
 import SharedArray as sa
 from sklearn.metrics import accuracy_score
+import os
 
 #WARNING FOR AVERAGE POOLING THIS RELIES ON THIS FORK OF PYLEARN2:
 # https://github.com/Vaishaal/pylearn2
