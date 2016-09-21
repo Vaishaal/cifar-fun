@@ -152,6 +152,8 @@ def conv(data, filter_gen, feature_batch_size, num_feature_batches, data_batch_s
                 XFinal[start:end,start_filters:end_filters,:,:] = XBlockOut
 
     filters = np.concatenate(filters,axis=0)
+    XBlock.set_value([[[[]]]])
+    FTheano.set_value([[[[]]]])
     return (XFinal, filters)
 
 def preprocess(train, test, min_divisor=1e-8, zca_bias=0.1):
