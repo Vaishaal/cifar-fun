@@ -202,57 +202,74 @@ def preprocess(train, test, min_divisor=1e-8, zca_bias=0.1):
 
     return (train.reshape(origTrainShape), test.reshape(origTestShape))
 
-def learnPrimal(trainData, labels, reg=0.1):
+def learnPrimal(trainData, labels, W=None, reg=0.1):
     '''Learn a model from trainData -> labels '''
 
     trainData = trainData.reshape(trainData.shape[0],-1)
+    n = trainData.shape[0]
     X = np.ascontiguousarray(trainData, dtype=np.float32).reshape(trainData.shape[0], -1)
+    if (W == None):
+        W = np.ones(n)[:, np.newaxis]
+
     print "X SHAPE ", trainData.shape
     print "Computing XTX"
-    XTX = X.T.dot(X)
+    sqrtW = np.sqrt(W)
+    X *= sqrtW
+    XTWX = X.T.dot(X)
     print "Done Computing XTX"
-    idxes = np.diag_indices(XTX.shape[0])
-    XTX[idxes] += reg
+    idxes = np.diag_indices(XTWX.shape[0])
+    XTWX[idxes] += reg
     y = np.eye(max(labels) + 1)[labels]
-    XTy = X.T.dot(y)
-    model = scipy.linalg.solve(XTX, XTy)
+    XTWy = X.T.dot(W * y)
+    model = scipy.linalg.solve(XTWX, XTWy)
     return model
 
-def learnDual(gramMatrix, labels, reg=0.1, TOT_FEAT=1, NUM_TRAIN=1):
+def learnDual(gramMatrix, labels, reg=0.1, W=None, TOT_FEAT=1, NUM_TRAIN=1):
     ''' Learn a model from K matrix -> labels '''
-    print ("Learning Dual Model updated")
+    print ("Learning Dual Model better")
+
+    n = gramMatrix.shape[0]
+    if (W == None):
+        W = np.ones(n)
+
+    W_inv = W.copy()
+    W_inv = 1.0/W_inv
+
     y = np.eye(max(labels) + 1)[labels]
-    idxes = np.diag_indices(gramMatrix.shape[0])
-    gramMatrix[idxes] += reg
-    model = scipy.linalg.solve(gramMatrix, y)
-    gramMatrix[idxes] -= reg
+    print "REG IS ", reg
+    diag_indices= np.diag_indices(gramMatrix.shape[0])
+    gramMatrix[diag_indices] += reg*W_inv
+    model = scipy.linalg.solve(gramMatrix, y, sym_pos=True)
+    gramMatrix[diag_indices] -= reg*W_inv
+
     return model
 
 def evaluatePrimalModel(data, model):
     data = data.reshape(data.shape[0],-1)
-    yHat = np.argmax(data.dot(model), axis=1)
-    return yHat
+    raw = data.dot(model)
+    yHat = np.argmax(raw, axis=1)
+    return yHat, raw
 
 
 def evaluateDualModel(kMatrix, model, TOT_FEAT=1):
+    kMatrix /= TOT_FEAT
     y = kMatrix.dot(model)
+    kMatrix *= TOT_FEAT
     yHat = np.argmax(y, axis=1)
     return yHat
 
-def trainAndEvaluateDualModel(KTrain, KTest, labelsTrain, labelsTest, reg=0.1):
-    model = learnDual(KTrain,labelsTrain, reg=reg)
-    predTrainLabels = evaluateDualModel(KTrain, model)
-    predTestLabels = evaluateDualModel(KTest, model)
+def trainAndEvaluateDualModel(KTrain, KTest, labelsTrain, labelsTest, reg=0.1, TOT_FEAT=1, W=None):
+    model = learnDual(KTrain,labelsTrain, reg=reg, TOT_FEAT=TOT_FEAT, W=W)
+    predTrainLabels = evaluateDualModel(KTrain, model, TOT_FEAT=TOT_FEAT)
+    predTestLabels = evaluateDualModel(KTest, model, TOT_FEAT=TOT_FEAT)
     train_acc = metrics.accuracy_score(labelsTrain, predTrainLabels)
     test_acc = metrics.accuracy_score(labelsTest, predTestLabels)
     return train_acc, test_acc
 
-
-
-def trainAndEvaluatePrimalModel(XTrain, XTest, labelsTrain, labelsTest, reg=0.1):
-    model = learnPrimal(XTrain, labelsTrain, reg=reg)
-    predTrainLabels = evaluatePrimalModel(XTrain, model)
-    predTestLabels = evaluatePrimalModel(XTest, model)
+def trainAndEvaluatePrimalModel(XTrain, XTest, labelsTrain, labelsTest, reg=0.1, W=None):
+    model = learnPrimal(XTrain, labelsTrain, reg=reg, W=W)
+    predTrainLabels, _ = evaluatePrimalModel(XTrain, model)
+    predTestLabels, _ = evaluatePrimalModel(XTest, model)
     train_acc = metrics.accuracy_score(labelsTrain, predTrainLabels)
     test_acc = metrics.accuracy_score(labelsTest, predTestLabels)
     print "CONFUSION MATRIX"
