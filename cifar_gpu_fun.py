@@ -54,15 +54,25 @@ def load_cifar(center=False):
     y_test = cifar_out["labels"]
     return (X_train, np.array(y_train)), (X_test, np.array(y_test))
 
-def conv(data, filter_gen, feature_batch_size, num_feature_batches, data_batch_size, cuda_convnet=True, symmetric_relu=True, start_feature_batch=0, pool_type='avg', pool_size=14, pad=0, bias=1.0, ps=6):
-    outX = int(math.ceil((data.shape[2] - ps + 1)/float(pool_size)))
-    outY = int(math.ceil((data.shape[3] - ps + 1)/float(pool_size)))
+def conv(data, filter_gen, feature_batch_size, num_feature_batches, data_batch_size, cuda_convnet=True, symmetric_relu=True, start_feature_batch=0, pool_type='avg', pool_size=14, pool_stride=14, pad=0, bias=1.0, ps=6):
+
+
+    strideStart = pool_size/2.0
+    outX = int(math.ceil(((data.shape[2] - ps + 1) - pool_size)/float(pool_stride))) + 1
+    outY = int(math.ceil(((data.shape[3] - ps + 1) - pool_size)/float(pool_stride))) + 1
+
+    print("Pool Size ", pool_size)
+    print("Pool Stride", pool_stride)
+    print ("out size: ", outX, "x",  outY)
     outFilters = feature_batch_size*num_feature_batches
     if (symmetric_relu):
         outFilters = 2*outFilters
 
     print "Out Shape ", outX, "x", outY, "x", outFilters
     XFinal = np.zeros((data.shape[0], outFilters, outX, outY), 'float32')
+
+    XBlock = None
+    FTheano = None
     filters = []
     numImages = data.shape[0]
     # Convert to cuda-convnet order
@@ -72,9 +82,9 @@ def conv(data, filter_gen, feature_batch_size, num_feature_batches, data_batch_s
     # POOL OP CREATION
     if (cuda_convnet):
         if (pool_type == 'avg'):
-            pool_op = AvgPool(ds=pool_size, stride=pool_size)
+            pool_op = AvgPool(ds=pool_size, stride=pool_stride)
         elif (pool_type == 'max'):
-            pool_op = MaxPool(ds=pool_size, stride=pool_size)
+            pool_op = MaxPool(ds=pool_size, stride=pool_stride)
         else:
             raise Exception('Unsupported pool type')
 
@@ -94,7 +104,10 @@ def conv(data, filter_gen, feature_batch_size, num_feature_batches, data_batch_s
             CHANNEL_AXIS = 0
 
         filters.append(F)
-        FTheano = shared(F.astype('float32'))
+        if (FTheano == None):
+            FTheano = shared(F.astype('float32'))
+        else:
+            FTheano.set_value(F.astype('float32'))
 
         start_filters = j*feature_batch_size
         end_filters = (j+1)*feature_batch_size
@@ -108,16 +121,17 @@ def conv(data, filter_gen, feature_batch_size, num_feature_batches, data_batch_s
                 end = min((i+1)*data_batch_size, numImages)
                 print "FEATURE BATCH #", (j + start_feature_batch), "DATA BATCH #", i,  " SIZE IS ", end - start
                 if (cuda_convnet):
-                    XBlock = shared(data[:, :, :, start:end])
+                    XBlock_cpu = data[:, :, :, start:end]
                 else:
-                    XBlock = shared(data[start:end, :, :, :])
+                    XBlock_cpu = data[start:end, :, :, :]
 
-                if (cuda_convnet):
-                    XBlock_gpu = gpu_contiguous(XBlock)
-                    FTheano_gpu = gpu_contiguous(FTheano)
+                if (XBlock == None):
+                    XBlock = shared(XBlock_cpu)
+                else:
+                    XBlock.set_value(XBlock_cpu)
 
                 # CONV
-                XBlock_conv_out = conv_op(XBlock_gpu, FTheano_gpu)
+                XBlock_conv_out = conv_op(XBlock, FTheano)
 
                 # RELU
                 XBlock0 = T.nnet.relu(XBlock_conv_out - bias, 0)
@@ -134,10 +148,7 @@ def conv(data, filter_gen, feature_batch_size, num_feature_batches, data_batch_s
                 if (cuda_convnet):
                     XBlockOut = XBlockOut.transpose(3,0,1,2)
                     F = F.transpose(3,0,1,2)
-
-                XBlock.set_value([[[[]]]])
                 XFinal[start:end,start_filters:end_filters,:,:] = XBlockOut
-        FTheano.set_value([[[[]]]])
 
     filters = np.concatenate(filters,axis=0)
     return (XFinal, filters)
