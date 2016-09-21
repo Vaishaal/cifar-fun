@@ -422,7 +422,8 @@ def patchify(img, patch_shape, pad=True, pad_mode='constant', cval=0):
     patches = np.lib.stride_tricks.as_strided(img, shape=shape, strides=strides)
     return patches
 
-def make_empirical_filter_gen(patches, labels, MIN_VAR_TOL=0):
+def make_empirical_filter_gen(patches, labels, MIN_VAR_TOL=0, seed=0):
+    np.random.seed(seed)
     patches = patches.reshape(patches.shape[0]*patches.shape[1],*patches.shape[2:])
     all_idxs = np.random.choice(patches.shape[0], patches.shape[0], replace=False)
     curr_idx = [0]
