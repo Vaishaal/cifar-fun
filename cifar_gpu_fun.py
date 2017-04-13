@@ -110,6 +110,7 @@ def conv(data, filter_gen, feature_batch_size, num_feature_batches, data_batch_s
         else:
             FTheano.set_value(F.astype('float32'))
 
+        FTheano_gpu = gpu_contiguous(FTheano)
         start_filters = j*feature_batch_size
         end_filters = (j+1)*feature_batch_size
 
@@ -121,6 +122,7 @@ def conv(data, filter_gen, feature_batch_size, num_feature_batches, data_batch_s
                 start = i*data_batch_size
                 end = min((i+1)*data_batch_size, numImages)
                 print "FEATURE BATCH #", (j + start_feature_batch), "DATA BATCH #", i,  " SIZE IS ", end - start
+                sys.stdout.flush()
                 if (cuda_convnet):
                     XBlock_cpu = data[:, :, :, start:end]
                 else:
@@ -131,8 +133,10 @@ def conv(data, filter_gen, feature_batch_size, num_feature_batches, data_batch_s
                 else:
                     XBlock.set_value(XBlock_cpu)
 
+                XBlock_gpu = gpu_contiguous(XBlock)
+
                 # CONV
-                XBlock_conv_out = conv_op(XBlock, FTheano)
+                XBlock_conv_out = conv_op(XBlock_gpu, FTheano_gpu)
 
                 # RELU
                 XBlock0 = T.nnet.relu(XBlock_conv_out - bias, 0)
@@ -276,7 +280,7 @@ def trainAndEvaluatePrimalModel(XTrain, XTest, labelsTrain, labelsTest, reg=0.1,
     test_acc = metrics.accuracy_score(labelsTest, predTestLabels)
     return train_acc, test_acc
 
-def convolveAndAccumulateGramAsync(XTrain, XTest, labelsTrain, labelsTest, filter_gen,  num_feature_batches=1, regs=[0.1], pool_size=14, FEATURE_BATCH_SIZE=1024, CUDA_CONVNET=True, DATA_BATCH_SIZE=1280, pool_stride=14, ps=6, symmetric_relu=True):
+def convolveAndAccumulateGramAsync(XTrain, XTest, labelsTrain, labelsTest, filter_gen,  num_feature_batches=1, regs=[0.1], pool_size=14, FEATURE_BATCH_SIZE=1024, CUDA_CONVNET=True, DATA_BATCH_SIZE=1280, pool_stride=14, ps=6, symmetric_relu=True, sync=4):
     all_filters = []
     X = np.vstack((XTrain, XTest))
     parent, child = Pipe()
@@ -296,10 +300,11 @@ def convolveAndAccumulateGramAsync(XTrain, XTest, labelsTrain, labelsTest, filte
     XBlock = None
     FTheano = None
 
-    p = Process(target=accumulateGramAndSolveAsync, args=(child, XTrain.shape[0], XTest.shape[0], regs, labelsTrain, labelsTest, XBatchShape, num_feature_batches, FEATURE_BATCH_SIZE))
+    p = Process(target=accumulateGramAndSolveAsync, args=(child, XTrain.shape[0], XTest.shape[0], regs, labelsTrain, labelsTest, XBatchShape, sync, num_feature_batches, FEATURE_BATCH_SIZE))
     p.start()
     for i in range(1, (num_feature_batches + 1)):
         print("Convolving features batch ", i)
+        print("Sync :{0}, i: {1}".format(sync, i))
         sys.stdout.flush()
         time1 = time.time()
         (XBatch, filters) = conv(X, filter_gen, FEATURE_BATCH_SIZE, 1, DATA_BATCH_SIZE, CUDA_CONVNET, symmetric_relu=symmetric_relu, start_feature_batch=i-1, pool_size=pool_size, pool_stride=pool_stride, ps=ps)
@@ -313,6 +318,11 @@ def convolveAndAccumulateGramAsync(XTrain, XTest, labelsTrain, labelsTest, filte
         parent.send(i)
         time2 = time.time()
         all_filters.append(filters)
+        if (i % sync == 0):
+            print("Syncing with Child")
+            sys.stdout.flush()
+            parent.recv()
+        gc.collect()
     parent.send(-1)
     parent.recv()
     trainKernelLocal = np.zeros((XTrain.shape[0], XTrain.shape[0]))
@@ -335,7 +345,7 @@ def convolveAndAccumulateGramAsync(XTrain, XTest, labelsTrain, labelsTest, filte
     os.remove("/run/shm/xtrainNorms")
     return trainKernelLocal, testKernelLocal, squaredNormTrainLocal, squaredNormTestLocal, all_filters
 
-def accumulateGramAndSolveAsync(pipe,  numTrain, numTest, regs, labelsTrain, labelsTest, XBatchShape, num_batches=1, batch_size=1):
+def accumulateGramAndSolveAsync(pipe,  numTrain, numTest, regs, labelsTrain, labelsTest, XBatchShape, sync, num_batches=1, batch_size=1):
     trainKernel = np.zeros((numTrain, numTrain), dtype='float32')
     testKernel= np.zeros((numTest, numTrain), dtype='float32')
 
@@ -361,8 +371,8 @@ def accumulateGramAndSolveAsync(pipe,  numTrain, numTest, regs, labelsTrain, lab
         XBatchTrain = XBatchLocal[:50000,:]
         XBatchTest = XBatchLocal[50000:,:]
 
-        squaredNormTrainShared += np.sum(XBatchTrain * XBatchTrain, axis=1)
-        squaredNormTestShared += np.sum(XBatchTest * XBatchTest, axis=1)
+        squaredNormTrainShared += np.sum(XBatchTrain * XBatchTrain, axis=1)/float(num_features)
+        squaredNormTestShared += np.sum(XBatchTest * XBatchTest, axis=1)/float(num_features)
 
         print("Accumulating (ASYNC) Gram")
         sys.stdout.flush()
@@ -372,7 +382,13 @@ def accumulateGramAndSolveAsync(pipe,  numTrain, numTest, regs, labelsTrain, lab
         testKernel += XBatchTest.dot(XBatchTrain.T)/float(num_features)
         time2 = time.time()
         print 'Accumulating (ASYNC) Batch {1} gram took {0} seconds'.format((time2-time1), i)
+        print("Sync :{0}, i: {1}".format(sync, i))
         sys.stdout.flush()
+        if (i % sync == 0):
+            print("Syncing with parent")
+            sys.stdout.flush()
+            pipe.send(1)
+
 
 
     np.copyto(trainKernelShared, trainKernel)
@@ -431,7 +447,8 @@ def make_empirical_filter_gen(patches, labels, MIN_VAR_TOL=0, seed=0):
         unfiltered = unfiltered.reshape(unfiltered.shape[0], -1)
         unfiltered_vars = np.var(unfiltered, axis=1)
         filtered = unfiltered[np.where(unfiltered_vars > MIN_VAR_TOL)]
-        out = filtered[:num_filters].reshape(num_filters, *old_shape[1:])
+        # make gc happy maybe?
+        out = np.ascontiguousarray(filtered[:num_filters].reshape(num_filters, *old_shape[1:]).copy())
         return out
     return empirical_filter_gen
 
@@ -457,7 +474,8 @@ def estimate_bandwidth(patches):
     patch_norms = np.linalg.norm(patches.reshape(patches.shape[0], -1), axis=1)
     return np.median(patch_norms)
 
-def make_gaussian_filter_gen(bandwidth, patch_size=6, channels=3):
+def make_gaussian_filter_gen(bandwidth, patch_size=6, channels=3, seed=0):
+    np.random.seed(seed)
     ps = patch_size
     def gaussian_filter_gen(num_filters):
         out = np.random.randn(num_filters, channels, ps, ps).astype('float32') * bandwidth
